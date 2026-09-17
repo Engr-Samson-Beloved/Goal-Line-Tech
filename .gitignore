@@ -1,0 +1,17 @@
+# Word lock files
+~$*.docx
+~$*.doc
+
+# OS junk
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Arduino / arduino-cli build artifacts (in case a local build path is ever used)
+build/
+*.hex
+*.elf
+*.map
+
+# Bring-up test captures (temporary verification photos, not project assets)
+camera_test_capture*.jpg
