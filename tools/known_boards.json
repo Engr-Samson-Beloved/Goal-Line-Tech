@@ -1,0 +1,12 @@
+{
+  "20:9b:a9:b2:11:70": {
+    "name": "ESP32-CAM (AI-Thinker, CH340 programmer base)",
+    "fqbn": "esp32:esp32:esp32cam",
+    "role": "camera"
+  },
+  "f4:2d:c9:70:70:b0": {
+    "name": "ESP32 DevKit #1 (CP2102)",
+    "fqbn": "esp32:esp32:esp32",
+    "role": "controller / wrist-unit candidate"
+  }
+}
