@@ -212,10 +212,15 @@ void setup() {
 
 void loop() {
   static unsigned long lastReconnectAttempt = 0;
-  if (WiFi.status() != WL_CONNECTED && millis() - lastReconnectAttempt > 5000) {
+  if (WiFi.status() != WL_CONNECTED && millis() - lastReconnectAttempt > 8000) {
     lastReconnectAttempt = millis();
     Serial.println("WiFi disconnected - reconnecting...");
-    WiFi.reconnect();
+    // A plain WiFi.reconnect() after a failed/stuck association just errors
+    // forever ("sta is connecting, return error") instead of recovering —
+    // a full disconnect + begin actually resets the driver's state.
+    WiFi.disconnect();
+    delay(100);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   }
   server.handleClient();
   delay(2);

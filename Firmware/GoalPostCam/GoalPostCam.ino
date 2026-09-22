@@ -100,6 +100,12 @@ void connectWifi() {
   Serial.print("Connecting to WiFi \"");
   Serial.print(WIFI_SSID);
   Serial.println("\" ...");
+  WiFi.mode(WIFI_STA);
+  // This board's TX current spikes at default (~19.5dBm) power are a known
+  // trigger for association failures when the CH340 programmer base's
+  // regulator can't keep up — dropping TX power trades a little range for
+  // a much better shot at actually associating.
+  WiFi.setTxPower(WIFI_POWER_11dBm);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   unsigned long start = millis();
@@ -178,18 +184,28 @@ void startCameraServer() {
 
 void setup() {
   Serial.begin(115200);   // UART0 — debug AND link to controller's UART2
+
+  // WiFi joins BEFORE the camera starts clocking: the camera's 20MHz XCLK
+  // sits close to the 2.4GHz WiFi antenna on this board and its harmonics
+  // are a well-known cause of association failures if it's already running
+  // when WiFi.begin() is called.
+  connectWifi();
   initCamera();
   SD_MMC.begin();
-  connectWifi();
   startCameraServer();
   Serial.println("ESP32-CAM ready. Waiting for CAPTURE command.");
 }
 
 void loop() {
   static unsigned long lastReconnectAttempt = 0;
-  if (WiFi.status() != WL_CONNECTED && millis() - lastReconnectAttempt > 5000) {
+  if (WiFi.status() != WL_CONNECTED && millis() - lastReconnectAttempt > 8000) {
     lastReconnectAttempt = millis();
-    WiFi.reconnect();
+    // A plain WiFi.reconnect() after a failed/stuck association just errors
+    // forever ("sta is connecting, return error") instead of recovering —
+    // a full disconnect + begin actually resets the driver's state.
+    WiFi.disconnect();
+    delay(100);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   }
 
   if (Serial.available()) {

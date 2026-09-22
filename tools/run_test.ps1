@@ -72,7 +72,10 @@ if (-not $Fqbn) {
 
 Write-Host ""
 Write-Host "Compiling and uploading $Test to $Port ($Fqbn) ..."
-arduino-cli compile --fqbn $Fqbn "$sketchFile" --upload -p $Port
+# --jobs 1: this machine is memory-constrained and arduino-cli's default
+# parallel compile (one cc1plus per CPU core) reliably thrashes/stalls here.
+# Sequential compilation is slower but doesn't crash.
+arduino-cli compile --jobs 1 --fqbn $Fqbn "$sketchFile" --upload -p $Port
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Compile/upload failed - see output above." -ForegroundColor Red
     exit 1
