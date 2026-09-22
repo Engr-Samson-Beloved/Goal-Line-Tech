@@ -13,6 +13,10 @@
 #include "esp_camera.h"
 #include "FS.h"
 #include "SD_MMC.h"
+#include <WiFi.h>
+#include <ESPmDNS.h>
+#include <esp_http_server.h>
+#include "wifi_credentials.h"
 
 // AI-Thinker ESP32-CAM pin definition
 #define PWDN_GPIO_NUM    32
@@ -33,6 +37,18 @@
 #define PCLK_GPIO_NUM    22
 
 int imageCount = 0;
+
+// ── LIVE MONITOR / STREAM WEB SERVER ──
+// Joins the phone hotspot in wifi_credentials.h. Page + snapshot serve on
+// port 80; the MJPEG stream runs on its own server on port 81 (its handler
+// loops forever per client, so it can't share a server with other routes).
+httpd_handle_t pageServer   = NULL;
+httpd_handle_t streamServer = NULL;
+
+#define PART_BOUNDARY "goallinecamboundary"
+static const char *STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
+static const char *STREAM_BOUNDARY     = "\r\n--" PART_BOUNDARY "\r\n";
+static const char *STREAM_PART         = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
 
 void initCamera() {
   camera_config_t config;
@@ -80,14 +96,102 @@ void captureAndSave() {
   esp_camera_fb_return(fb);
 }
 
+void connectWifi() {
+  Serial.print("Connecting to WiFi \"");
+  Serial.print(WIFI_SSID);
+  Serial.println("\" ...");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+    delay(300);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("WiFi connected. IP: ");
+    Serial.println(WiFi.localIP());
+    if (MDNS.begin("goalpostcam")) {
+      Serial.println("mDNS responder started: http://goalpostcam.local");
+    }
+  } else {
+    Serial.println("WiFi connect failed - will keep retrying in the background.");
+  }
+}
+
+static esp_err_t stream_handler(httpd_req_t *req) {
+  esp_err_t res = httpd_resp_set_type(req, STREAM_CONTENT_TYPE);
+  if (res != ESP_OK) return res;
+
+  while (true) {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+      res = ESP_FAIL;
+    } else {
+      res = httpd_resp_send_chunk(req, STREAM_BOUNDARY, strlen(STREAM_BOUNDARY));
+      if (res == ESP_OK) {
+        char header[64];
+        size_t hlen = snprintf(header, sizeof(header), STREAM_PART, fb->len);
+        res = httpd_resp_send_chunk(req, header, hlen);
+      }
+      if (res == ESP_OK) {
+        res = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
+      }
+      esp_camera_fb_return(fb);
+    }
+    if (res != ESP_OK) break;
+  }
+  return res;
+}
+
+static esp_err_t index_handler(httpd_req_t *req) {
+  httpd_resp_set_type(req, "text/html");
+  String ip = WiFi.localIP().toString();
+  String html = "<!DOCTYPE html><html><head><title>Goal Post Cam</title>"
+    "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+    "<style>body{font-family:sans-serif;background:#111;color:#eee;text-align:center;padding:20px}"
+    "h1{color:#4caf50}img{max-width:100%;border-radius:8px}</style></head>"
+    "<body><h1>Goal Post Cam - Live</h1>"
+    "<img src='http://" + ip + ":81/stream'></body></html>";
+  return httpd_resp_send(req, html.c_str(), html.length());
+}
+
+void startCameraServer() {
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.server_port = 80;
+  config.ctrl_port    = 32760;
+
+  httpd_uri_t index_uri = { .uri = "/", .method = HTTP_GET, .handler = index_handler, .user_ctx = NULL };
+  if (httpd_start(&pageServer, &config) == ESP_OK) {
+    httpd_register_uri_handler(pageServer, &index_uri);
+  }
+
+  config.server_port = 81;
+  config.ctrl_port    = 32761;
+  config.stack_size   = 8192;
+  httpd_uri_t stream_uri = { .uri = "/stream", .method = HTTP_GET, .handler = stream_handler, .user_ctx = NULL };
+  if (httpd_start(&streamServer, &config) == ESP_OK) {
+    httpd_register_uri_handler(streamServer, &stream_uri);
+  }
+}
+
 void setup() {
   Serial.begin(115200);   // UART0 — debug AND link to controller's UART2
   initCamera();
   SD_MMC.begin();
+  connectWifi();
+  startCameraServer();
   Serial.println("ESP32-CAM ready. Waiting for CAPTURE command.");
 }
 
 void loop() {
+  static unsigned long lastReconnectAttempt = 0;
+  if (WiFi.status() != WL_CONNECTED && millis() - lastReconnectAttempt > 5000) {
+    lastReconnectAttempt = millis();
+    WiFi.reconnect();
+  }
+
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
     cmd.trim();

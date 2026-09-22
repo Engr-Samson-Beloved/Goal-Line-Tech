@@ -21,15 +21,19 @@
 
 #include <esp_now.h>
 #include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
 #include <SD.h>
 #include <SPI.h>
+#include "wifi_credentials.h"
 
 // ── CONFIGURATION ──────────────────────────────────────────────
 const String POST_ID = "A";          // "A" or "B"
 
-// Wrist unit MAC address — replace with your ESP32-C3's real MAC.
-// Flash GetWristMAC.ino to the wrist unit and read it from Serial Monitor.
-uint8_t WRIST_MAC[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+// Wrist unit MAC address — ESP32-S DevKit #2 (CH340, COM3), bench-test
+// stand-in for the eventual ESP32-C3 Super Mini wearable. See
+// ../../tools/known_boards.json and firmware/WristUnit/WristUnit.ino.
+uint8_t WRIST_MAC[] = {0xD4, 0xE9, 0xF4, 0xA1, 0xCF, 0xEC};
 
 // ── PRIMARY BEAM RECEIVER PINS (through 2N2222 level-shift buffer) ──
 // GPIO12 is intentionally excluded (must read LOW at boot or the module
@@ -54,6 +58,15 @@ bool primaryTriggered  = false;
 bool ackReceived        = false;
 unsigned long primaryTime = 0;
 
+// ── LIVE MONITOR WEB SERVER ──
+// Joins the phone hotspot in wifi_credentials.h so the phone (or anything
+// else on that hotspot) can load a live status page from this board.
+WebServer server(80);
+unsigned long bootMillis = 0;
+String lastEventResult = "none yet";
+unsigned long lastEventMillis = 0;
+bool sdReady = false;
+
 const unsigned long DIRECTION_WINDOW = 50;   // milliseconds
 const unsigned long ACK_TIMEOUT      = 200;  // milliseconds
 const int MAX_RETRIES                = 3;
@@ -70,6 +83,8 @@ typedef struct {
 // LOGGING
 // ════════════════════════════════════════════════════════════════
 void logEvent(String result, int beamTriggered, int tcrtTriggered) {
+  lastEventResult = result;
+  lastEventMillis = millis();
   if (!SD.begin(SD_CS)) return;
   File f = SD.open("/goallog.txt", FILE_APPEND);
   if (f) {
@@ -106,7 +121,7 @@ void sendGoalSignal(int beamNum, int tcrtNum) {
   ackReceived = false;
 
   for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    Serial.print("Sending goal signal — attempt ");
+    Serial.print("Sending goal signal - attempt ");
     Serial.println(attempt);
     esp_now_send(WRIST_MAC, (uint8_t*)&msg, sizeof(msg));
 
@@ -160,6 +175,72 @@ void requestCameraCapture() {
 }
 
 // ════════════════════════════════════════════════════════════════
+// WIFI + LIVE MONITOR PAGE
+// ════════════════════════════════════════════════════════════════
+void connectWifi() {
+  Serial.print("Connecting to WiFi \"");
+  Serial.print(WIFI_SSID);
+  Serial.println("\" ...");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+    delay(300);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("WiFi connected. IP: ");
+    Serial.println(WiFi.localIP());
+    String host = "goalpost" + POST_ID;
+    if (MDNS.begin(host.c_str())) {
+      Serial.print("mDNS responder started: http://");
+      Serial.print(host);
+      Serial.println(".local");
+    }
+  } else {
+    Serial.println("WiFi connect failed - will keep retrying in the background.");
+  }
+}
+
+void handleRoot() {
+  unsigned long upSec = (millis() - bootMillis) / 1000;
+  unsigned long sinceEvent = (millis() - lastEventMillis) / 1000;
+  bool wifiOk = WiFi.status() == WL_CONNECTED;
+
+  String html = "<!DOCTYPE html><html><head><title>Goal Post " + POST_ID + " Monitor</title>";
+  html += "<meta http-equiv='refresh' content='2'>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>body{font-family:sans-serif;background:#111;color:#eee;padding:20px}"
+          "h1{color:#4caf50}.card{background:#222;border-radius:8px;padding:16px;margin-bottom:12px}"
+          ".ok{color:#4caf50}.warn{color:#ff9800}</style></head><body>";
+  html += "<h1>Goal Post " + POST_ID + " - Live Monitor</h1>";
+  html += "<div class='card'><b>MAC:</b> " + WiFi.macAddress() + "<br>";
+  html += "<b>WiFi:</b> <span class='" + String(wifiOk ? "ok" : "warn") + "'>" +
+          String(wifiOk ? "connected" : "disconnected") + "</span><br>";
+  html += "<b>IP:</b> " + WiFi.localIP().toString() + "<br>";
+  html += "<b>RSSI:</b> " + String(WiFi.RSSI()) + " dBm<br>";
+  html += "<b>SD card:</b> " + String(sdReady ? "ready" : "not found") + "<br>";
+  html += "<b>Uptime:</b> " + String(upSec) + " s</div>";
+
+  html += "<div class='card'><h3>Beam sensors (live)</h3><table style='width:100%'>";
+  for (int i = 0; i < 8; i++) {
+    html += "<tr><td>R" + String(i + 1) + "</td><td>" +
+            String(digitalRead(PRIMARY[i]) == HIGH ? "BROKEN" : "clear") + "</td>"
+            "<td>S" + String(i + 1) + "</td><td>" +
+            String(digitalRead(SECONDARY[i]) == LOW ? "DETECTED" : "clear") + "</td></tr>";
+  }
+  html += "</table></div>";
+
+  html += "<div class='card'><h3>Last event</h3>" + lastEventResult +
+          " (" + String(sinceEvent) + " s ago)</div>";
+  html += "</body></html>";
+
+  server.send(200, "text/html", html);
+}
+
+// ════════════════════════════════════════════════════════════════
 // SETUP
 // ════════════════════════════════════════════════════════════════
 void setup() {
@@ -175,10 +256,11 @@ void setup() {
   }
 
   // Initialise SD card
-  if (SD.begin(SD_CS)) {
+  sdReady = SD.begin(SD_CS);
+  if (sdReady) {
     Serial.println("SD card ready.");
   } else {
-    Serial.println("SD card not found — logging disabled.");
+    Serial.println("SD card not found - logging disabled.");
   }
 
   // Initialise ESP-NOW
@@ -196,6 +278,12 @@ void setup() {
   peer.encrypt = false;
   esp_now_add_peer(&peer);
 
+  connectWifi();
+  bootMillis = millis();
+  server.on("/", handleRoot);
+  server.begin();
+  Serial.println("Web server started.");
+
   Serial.print("Goal Post ");
   Serial.print(POST_ID);
   Serial.println(" ready and monitoring.");
@@ -205,6 +293,14 @@ void setup() {
 // MAIN LOOP
 // ════════════════════════════════════════════════════════════════
 void loop() {
+  static unsigned long lastReconnectAttempt = 0;
+  if (WiFi.status() != WL_CONNECTED && millis() - lastReconnectAttempt > 5000) {
+    lastReconnectAttempt = millis();
+    Serial.println("WiFi disconnected - reconnecting...");
+    WiFi.reconnect();
+  }
+  server.handleClient();
+
   // ── STEP 1: Check primary beam sensors ──
   int beamIndex = checkPrimary();
   if (beamIndex >= 0 && !primaryTriggered) {

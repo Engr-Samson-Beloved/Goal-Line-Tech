@@ -15,3 +15,6 @@ build/
 
 # Bring-up test captures (temporary verification photos, not project assets)
 camera_test_capture*.jpg
+
+# WiFi/hotspot credentials — plaintext SSID/password, per-sketch-folder
+wifi_credentials.h

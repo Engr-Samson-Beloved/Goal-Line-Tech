@@ -8,5 +8,10 @@
     "name": "ESP32 DevKit #1 (CP2102)",
     "fqbn": "esp32:esp32:esp32",
     "role": "controller / wrist-unit candidate"
+  },
+  "d4:e9:f4:a1:cf:ec": {
+    "name": "ESP32-S DevKit #2 (CH340, COM3)",
+    "fqbn": "esp32:esp32:esp32",
+    "role": "wrist unit (bench-test stand-in for ESP32-C3 Super Mini) — runs firmware/WristUnit"
   }
 }
