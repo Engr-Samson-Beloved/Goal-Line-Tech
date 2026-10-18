@@ -242,11 +242,16 @@ void recordFrame() {
 }
 
 static esp_err_t streamHandler(httpd_req_t *request) {
+  if (matchState != STATE_ACTIVE) {
+    httpd_resp_set_status(request, "409 Conflict");
+    httpd_resp_set_type(request, "text/plain");
+    return httpd_resp_sendstr(request, "Stream starts when the match is ACTIVE");
+  }
   httpd_resp_set_type(request, STREAM_TYPE);
   httpd_resp_set_hdr(request, "Cache-Control", "no-store");
   esp_err_t result = ESP_OK;
-  while (result == ESP_OK) {
-    if (matchState != STATE_ACTIVE || !cameraReady) { delay(100); continue; }
+  while (result == ESP_OK && matchState == STATE_ACTIVE) {
+    if (!cameraReady) { delay(100); continue; }
     if (xSemaphoreTake(cameraMutex, pdMS_TO_TICKS(500)) != pdTRUE) continue;
     camera_fb_t *frame = esp_camera_fb_get();
     if (!frame) { xSemaphoreGive(cameraMutex); delay(20); continue; }
@@ -261,6 +266,7 @@ static esp_err_t streamHandler(httpd_req_t *request) {
     xSemaphoreGive(cameraMutex);
     delay(40);
   }
+  if (result == ESP_OK) httpd_resp_send_chunk(request, nullptr, 0);
   return result;
 }
 
@@ -276,7 +282,15 @@ static esp_err_t statusHandler(httpd_req_t *request) {
 }
 
 static esp_err_t indexHandler(httpd_req_t *request) {
-  const char page[] = R"HTML(<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Goal Post Camera</title><style>body{font-family:Arial;background:#101410;color:white;text-align:center;padding:16px}h1{color:#65d46e}img{width:100%;max-width:800px;background:#000;border-radius:12px}.card{max-width:820px;margin:auto;background:#1c251d;padding:14px;border-radius:12px}</style></head><body><div class="card"><h1>Goal Post Camera</h1><p id="state">Loading...</p><img id="video" src="http://192.168.4.2:81/stream"><p><a href="/sessions" style="color:#8ee897">Recorded sessions</a></p></div><script>setInterval(async()=>{try{let s=await(await fetch('/status')).json();state.textContent=s.state+' | '+(s.recording?'RECORDING':s.sdReady?'SD READY':'NO SD')}catch(e){state.textContent='OFFLINE'}},1000)</script></body></html>)HTML";
+  const char page[] = R"HTML(<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Goal Post Camera</title><style>body{font-family:Arial;background:#101410;color:white;text-align:center;padding:16px}h1{color:#65d46e}img{width:100%;max-width:800px;min-height:180px;background:#000;border-radius:12px}.card{max-width:820px;margin:auto;background:#1c251d;padding:14px;border-radius:12px}.muted{color:#b9c6ba}</style></head><body><div class="card"><h1>Goal Post Camera</h1><p id="state">Loading...</p><img id="video" alt="Live video starts during an active match"><p class="muted" id="videoState">Waiting for ACTIVE match</p><p><a href="/sessions" style="color:#8ee897">Recorded sessions</a></p></div><script>
+const video=document.getElementById('video'),videoState=document.getElementById('videoState');let active=false,retry=0;
+function startVideo(){if(!active)return;clearTimeout(retry);videoState.textContent='Connecting live video...';video.src='http://192.168.4.2:81/stream?t='+Date.now()}
+function stopVideo(){clearTimeout(retry);video.removeAttribute('src');videoState.textContent='Waiting for ACTIVE match'}
+video.onload=()=>{if(active)videoState.textContent='LIVE'};
+video.onerror=()=>{video.removeAttribute('src');if(active){videoState.textContent='Reconnecting camera...';retry=setTimeout(startVideo,1500)}};
+async function update(){try{const s=await(await fetch('/status',{cache:'no-store'})).json();state.textContent=s.state+' | '+(s.recording?'RECORDING':s.sdReady?'SD READY':'NO SD');const next=s.state==='ACTIVE';if(next&&!active){active=true;startVideo()}else if(!next&&active){active=false;stopVideo()}}catch(e){state.textContent='OFFLINE';active=false;stopVideo()}}
+setInterval(update,1000);update();
+</script></body></html>)HTML";
   httpd_resp_set_type(request, "text/html");
   return httpd_resp_send(request, page, HTTPD_RESP_USE_STRLEN);
 }
