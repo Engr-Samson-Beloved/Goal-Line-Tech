@@ -16,5 +16,17 @@ build/
 # Bring-up test captures (temporary verification photos, not project assets)
 camera_test_capture*.jpg
 
+# Local embedded build environments and caches
+.pio-home/
+.tmp-esptool/
+.pio-*/.pio/
+.pio-controller-test/
+.pio-cam-test/
+.arduino-*/
+.arduino-*.yaml
+.arduino-cli.zip
+*.log
+g.ctags-*.*
+
 # WiFi/hotspot credentials — plaintext SSID/password, per-sketch-folder
 wifi_credentials.h

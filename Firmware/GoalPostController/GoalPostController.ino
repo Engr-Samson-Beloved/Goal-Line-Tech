@@ -1,338 +1,268 @@
-// ============================================================
-// SMART GOAL-LINE DETECTION SYSTEM
-// Goal Post Controller Firmware — ESP32 DevKit V1 (30-pin)
-// Change POST_ID below: "A" for Goal Post A, "B" for Goal Post B
-//
-// REVISED PIN MAP — see ../../WIRING_NOTES.md for the full reason.
-// Short version: the original spec routed 5 of the 8 TCRT5000 pins
-// onto the SD card's SPI bus (GPIO 23/19/18) and the ESP32-CAM UART2
-// (GPIO 16/17), which would corrupt SD writes and camera commands
-// the moment a sensor fired. It also wired each E3F-10DN receiver
-// (referenced to 12V) straight into a GPIO through only a series
-// resistor — the ESP32 is only 3.3V-tolerant, so an idle beam would
-// eventually kill that pin. Both are fixed here:
-//   - SPI (SD) and UART2 (CAM) pins are now reserved and untouched
-//     by any sensor.
-//   - Each E3F-10DN beam receiver goes through a 2N2222 buffer/level
-//     shifter (12V signal -> clean 0-3.3V) before reaching a GPIO.
-//     That buffer inverts the signal, so "beam broken" now reads
-//     HIGH instead of LOW — see checkPrimary() below.
-// ============================================================
-
 #include <esp_now.h>
+#include <esp_wifi.h>
 #include <WiFi.h>
-#include <WebServer.h>
-#include <ESPmDNS.h>
-#include <SD.h>
-#include <SPI.h>
-#include "wifi_credentials.h"
+#include <Wire.h>
+#include <HUSKYLENS.h>
+#include <esp_arduino_version.h>
 
-// ── CONFIGURATION ──────────────────────────────────────────────
-const String POST_ID = "A";          // "A" or "B"
+constexpr uint8_t CHANNEL = 1;
+constexpr uint8_t SENSOR_COUNT = 4;
+constexpr uint8_t SENSOR_PINS[SENSOR_COUNT] = {13, 14, 27, 26};
+constexpr uint8_t ACTIVE_LEVEL = LOW;
+constexpr uint32_t DEBOUNCE_MS = 40;
+constexpr uint32_t GROUP_WINDOW_MS = 100;
+constexpr uint32_t RELEASE_MS = 300;
+constexpr uint32_t HEARTBEAT_MS = 1000;
+constexpr uint32_t ACK_TIMEOUT_MS = 250;
+constexpr uint8_t MAX_RETRIES = 8;
 
-// Wrist unit MAC address — ESP32-S DevKit #2 (CH340, COM3), bench-test
-// stand-in for the eventual ESP32-C3 Super Mini wearable. See
-// ../../tools/known_boards.json and firmware/WristUnit/WristUnit.ino.
-uint8_t WRIST_MAC[] = {0xD4, 0xE9, 0xF4, 0xA1, 0xCF, 0xEC};
+// Optional HUSKYLENS assistant. Sensor-only operation remains available when
+// the camera is absent or stops answering. Leave decision assistance disabled
+// until the installed camera and its goal-line zone have been calibrated.
+constexpr uint8_t HUSKY_SDA_PIN = 21;
+constexpr uint8_t HUSKY_SCL_PIN = 22;
+constexpr uint8_t HUSKY_I2C_ADDRESS = 0x32;
+constexpr int16_t HUSKY_BALL_ID = 1;
+constexpr int16_t HUSKY_GOAL_ZONE_X_MIN = 100;
+constexpr int16_t HUSKY_GOAL_ZONE_X_MAX = 220;
+constexpr uint32_t HUSKY_RETRY_MS = 5000;
+constexpr bool HUSKY_DECISION_ENABLED = false;
 
-// ── PRIMARY BEAM RECEIVER PINS (through 2N2222 level-shift buffer) ──
-// GPIO12 is intentionally excluded (must read LOW at boot or the module
-// picks the wrong flash voltage); GPIO0 is intentionally excluded (tied
-// to the BOOT button — reusing it risks a stuck ball forcing download mode).
-const int PRIMARY[8] = {13, 14, 27, 26, 25, 33, 32, 4};
-//                       R1  R2  R3  R4  R5  R6  R7  R8
-//                      10cm 35cm 60cm 90cm 120cm 150cm 180cm 210cm
+uint8_t wristMac[] = {0x1C, 0xDB, 0xD4, 0xD3, 0x6C, 0x4C};
+enum Type : uint8_t { PKT_STATUS = 1, COMMAND = 2, ACK = 3 };
+enum Cmd : uint8_t { START = 1, PAUSE, RESUME, RESET, CLEAR, END };
+struct __attribute__((packed)) Packet {
+  uint8_t type, command, mask, count;
+  uint32_t sequence, timestamp;
+};
 
-// ── SECONDARY TCRT5000 PINS (direct — module has its own comparator,
-//    no external pull-up needed, so input-only pins 34/35/36/39 are fine) ──
-const int SECONDARY[8] = {21, 22, 15, 34, 35, 36, 39, 2};
-//                         S1  S2  S3  S4  S5  S6  S7  S8
+volatile bool matchActive = false;
+volatile bool eventLatched = false;
+volatile bool eventPending = false;
+uint8_t candidateMask = 0;
+uint8_t groupedMask = 0;
+uint8_t retryCount = 0;
+uint32_t candidateSince = 0;
+uint32_t groupStarted = 0;
+uint32_t clearSince = 0;
+uint32_t lastHeartbeat = 0;
+uint32_t lastAttempt = 0;
+uint32_t nextSequence = 0;
+Packet pendingPacket = {};
+HUSKYLENS huskyLens;
+bool huskyOnline = false;
+uint32_t lastHuskyAttempt = 0;
 
-// ── RESERVED — do not reassign these to any sensor ──
-// SPI (hardware VSPI default) for the SD card: MOSI=23 MISO=19 SCK=18 CS=5
-// UART2 for the ESP32-CAM link: RX2=16 TX2=17
-const int SD_CS = 5;
-
-// ── STATE VARIABLES ──────────────────────────────────────────────
-bool primaryTriggered  = false;
-bool ackReceived        = false;
-unsigned long primaryTime = 0;
-
-// ── LIVE MONITOR WEB SERVER ──
-// Joins the phone hotspot in wifi_credentials.h so the phone (or anything
-// else on that hotspot) can load a live status page from this board.
-WebServer server(80);
-unsigned long bootMillis = 0;
-String lastEventResult = "none yet";
-unsigned long lastEventMillis = 0;
-bool sdReady = false;
-
-const unsigned long DIRECTION_WINDOW = 50;   // milliseconds
-const unsigned long ACK_TIMEOUT      = 200;  // milliseconds
-const int MAX_RETRIES                = 3;
-const unsigned long COOLDOWN         = 3000; // milliseconds
-
-// ── MESSAGE STRUCTURE ──────────────────────────────────────────────
-typedef struct {
-  char postID[2];
-  bool isGoal;
-  unsigned long timestamp;
-} GoalMessage;
-
-// ════════════════════════════════════════════════════════════════
-// LOGGING
-// ════════════════════════════════════════════════════════════════
-void logEvent(String result, int beamTriggered, int tcrtTriggered) {
-  lastEventResult = result;
-  lastEventMillis = millis();
-  if (!SD.begin(SD_CS)) return;
-  File f = SD.open("/goallog.txt", FILE_APPEND);
-  if (f) {
-    f.print("TIME:");
-    f.print(millis());
-    f.print(" POST:");
-    f.print(POST_ID);
-    f.print(" BEAM:");
-    f.print(beamTriggered);
-    f.print(" TCRT:");
-    f.print(tcrtTriggered);
-    f.print(" RESULT:");
-    f.println(result);
-    f.close();
+uint8_t readSensorMask() {
+  uint8_t mask = 0;
+  for (uint8_t index = 0; index < SENSOR_COUNT; ++index) {
+    if (digitalRead(SENSOR_PINS[index]) == ACTIVE_LEVEL) mask |= 1u << index;
   }
+  return mask;
 }
 
-// ════════════════════════════════════════════════════════════════
-// ESP-NOW — ACK RECEIVED FROM WRIST UNIT
-// ════════════════════════════════════════════════════════════════
-void onDataRecv(const esp_now_recv_info *info, const uint8_t *data, int len) {
-  ackReceived = true;
-  Serial.println("ACK received from wrist unit.");
+uint8_t bitCount(uint8_t value) {
+  uint8_t count = 0;
+  while (value) { count += value & 1u; value >>= 1; }
+  return count;
 }
 
-// ════════════════════════════════════════════════════════════════
-// SEND GOAL SIGNAL TO WRIST UNIT (with retry)
-// ════════════════════════════════════════════════════════════════
-void sendGoalSignal(int beamNum, int tcrtNum) {
-  GoalMessage msg;
-  POST_ID.toCharArray(msg.postID, 2);
-  msg.isGoal    = true;
-  msg.timestamp = millis();
-  ackReceived = false;
+void transmit(const Packet &packet) {
+  esp_err_t result = esp_now_send(wristMac, (const uint8_t *)&packet, sizeof(packet));
+  if (result != ESP_OK) Serial.printf("ESP-NOW queue error: %d\n", result);
+}
 
-  for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    Serial.print("Sending goal signal - attempt ");
-    Serial.println(attempt);
-    esp_now_send(WRIST_MAC, (uint8_t*)&msg, sizeof(msg));
+void sendHeartbeat(uint8_t currentMask) {
+  Packet packet = {};
+  packet.type = PKT_STATUS;
+  packet.mask = currentMask;
+  packet.count = 0;
+  packet.sequence = 0;
+  packet.timestamp = millis();
+  transmit(packet);
+}
 
-    unsigned long sent = millis();
-    while (!ackReceived && (millis() - sent) < ACK_TIMEOUT) {
-      delay(5);
-    }
-    if (ackReceived) {
-      Serial.println("GOAL confirmed and acknowledged.");
-      logEvent("GOAL_CONFIRMED", beamNum, tcrtNum);
-      return;
-    }
+bool huskyAddressPresent() {
+  Wire.beginTransmission(HUSKY_I2C_ADDRESS);
+  return Wire.endTransmission() == 0;
+}
+
+void connectHuskyLens(uint32_t now) {
+  // Never spend time negotiating an optional camera during active play.
+  if (matchActive || huskyOnline || now - lastHuskyAttempt < HUSKY_RETRY_MS) return;
+  lastHuskyAttempt = now;
+  if (!huskyAddressPresent()) return;
+  huskyLens.setTimeOutDuration(25);
+  huskyOnline = huskyLens.begin(Wire);
+  Serial.printf("HUSKYLENS: %s\n", huskyOnline ? "online" : "detected but not responding");
+}
+
+enum VisionResult : uint8_t { VISION_UNAVAILABLE, BALL_CONFIRMED, BALL_NOT_CONFIRMED };
+
+VisionResult checkBallAtGoal() {
+  if (!huskyOnline) return VISION_UNAVAILABLE;
+  if (!huskyLens.requestBlocks(HUSKY_BALL_ID)) {
+    huskyOnline = false;
+    lastHuskyAttempt = millis();
+    Serial.println("HUSKYLENS: communication lost; sensor-only fallback active");
+    return VISION_UNAVAILABLE;
   }
-  Serial.println("WARNING: No ACK received after 3 attempts.");
-  logEvent("GOAL_NO_ACK", beamNum, tcrtNum);
-}
 
-// ════════════════════════════════════════════════════════════════
-// CHECK PRIMARY BEAMS — returns index of triggered beam, -1 if none
-// NOTE: the 2N2222 buffer inverts the signal, so a BROKEN beam now
-// reads HIGH at the GPIO (idle/clear beam reads LOW).
-// ════════════════════════════════════════════════════════════════
-int checkPrimary() {
-  for (int i = 0; i < 8; i++) {
-    if (digitalRead(PRIMARY[i]) == HIGH) {
-      return i;
+  while (huskyLens.available()) {
+    HUSKYLENSResult result = huskyLens.read();
+    int16_t left = result.xCenter - result.width / 2;
+    int16_t right = result.xCenter + result.width / 2;
+    if (right >= HUSKY_GOAL_ZONE_X_MIN && left <= HUSKY_GOAL_ZONE_X_MAX) {
+      Serial.printf("HUSKYLENS: ball ID %d in goal zone, x=%d width=%d\n",
+                    result.ID, result.xCenter, result.width);
+      return BALL_CONFIRMED;
     }
   }
-  return -1;
+  Serial.println("HUSKYLENS: no learned ball in goal zone");
+  return BALL_NOT_CONFIRMED;
 }
 
-// ════════════════════════════════════════════════════════════════
-// CHECK SECONDARY TCRT — returns index of triggered sensor, -1 if none
-// TCRT5000 module drives this directly LOW when the ball is detected.
-// ════════════════════════════════════════════════════════════════
-int checkSecondary() {
-  for (int i = 0; i < 8; i++) {
-    if (digitalRead(SECONDARY[i]) == LOW) {
-      return i;
+void beginReliableEvent(uint8_t eventMask) {
+  uint8_t sensorCount = bitCount(eventMask);
+  uint8_t decisionCount = sensorCount;
+  VisionResult vision = VISION_UNAVAILABLE;
+  if (HUSKY_DECISION_ENABLED && sensorCount == 1) {
+    vision = checkBallAtGoal();
+    if (vision == BALL_NOT_CONFIRMED) {
+      decisionCount = 2; // Existing wrist protocol displays CHECK VAR for 2+.
     }
   }
-  return -1;
+
+  pendingPacket = {};
+  pendingPacket.type = PKT_STATUS;
+  pendingPacket.mask = eventMask;
+  pendingPacket.count = decisionCount;
+  pendingPacket.sequence = ++nextSequence;
+  if (pendingPacket.sequence == 0) pendingPacket.sequence = ++nextSequence;
+  pendingPacket.timestamp = millis();
+  eventPending = true;
+  retryCount = 0;
+  lastAttempt = millis();
+  transmit(pendingPacket);
+  // In monitor-only mode the proven sensor decision is already on the air
+  // before the optional camera is queried.
+  if (!HUSKY_DECISION_ENABLED) vision = checkBallAtGoal();
+  const char *visionText = vision == BALL_CONFIRMED ? "confirmed" :
+                           vision == BALL_NOT_CONFIRMED ? "not-confirmed" : "unavailable";
+  Serial.printf("EVENT seq=%lu mask=0x%02X sensors=%u decision=%s vision=%s\n",
+                (unsigned long)pendingPacket.sequence, pendingPacket.mask,
+                sensorCount, pendingPacket.count == 1 ? "GOAL" : "CHECK VAR",
+                visionText);
 }
 
-// ════════════════════════════════════════════════════════════════
-// ASK ESP32-CAM TO CAPTURE A FRAME
-// ════════════════════════════════════════════════════════════════
-void requestCameraCapture() {
-  Serial2.println("CAPTURE");   // ESP32-CAM listens on its UART
-  delay(100);                   // give camera time to respond
-}
-
-// ════════════════════════════════════════════════════════════════
-// WIFI + LIVE MONITOR PAGE
-// ════════════════════════════════════════════════════════════════
-void connectWifi() {
-  Serial.print("Connecting to WiFi \"");
-  Serial.print(WIFI_SSID);
-  Serial.println("\" ...");
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
-    delay(300);
-    Serial.print(".");
-  }
-  Serial.println();
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("WiFi connected. IP: ");
-    Serial.println(WiFi.localIP());
-    String host = "goalpost" + POST_ID;
-    if (MDNS.begin(host.c_str())) {
-      Serial.print("mDNS responder started: http://");
-      Serial.print(host);
-      Serial.println(".local");
-    }
-  } else {
-    Serial.println("WiFi connect failed - will keep retrying in the background.");
-  }
-}
-
-void handleRoot() {
-  unsigned long upSec = (millis() - bootMillis) / 1000;
-  unsigned long sinceEvent = (millis() - lastEventMillis) / 1000;
-  bool wifiOk = WiFi.status() == WL_CONNECTED;
-
-  String html = "<!DOCTYPE html><html><head><title>Goal Post " + POST_ID + " Monitor</title>";
-  html += "<meta http-equiv='refresh' content='2'>";
-  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
-  html += "<style>body{font-family:sans-serif;background:#111;color:#eee;padding:20px}"
-          "h1{color:#4caf50}.card{background:#222;border-radius:8px;padding:16px;margin-bottom:12px}"
-          ".ok{color:#4caf50}.warn{color:#ff9800}</style></head><body>";
-  html += "<h1>Goal Post " + POST_ID + " - Live Monitor</h1>";
-  html += "<div class='card'><b>MAC:</b> " + WiFi.macAddress() + "<br>";
-  html += "<b>WiFi:</b> <span class='" + String(wifiOk ? "ok" : "warn") + "'>" +
-          String(wifiOk ? "connected" : "disconnected") + "</span><br>";
-  html += "<b>IP:</b> " + WiFi.localIP().toString() + "<br>";
-  html += "<b>RSSI:</b> " + String(WiFi.RSSI()) + " dBm<br>";
-  html += "<b>SD card:</b> " + String(sdReady ? "ready" : "not found") + "<br>";
-  html += "<b>Uptime:</b> " + String(upSec) + " s</div>";
-
-  html += "<div class='card'><h3>Beam sensors (live)</h3><table style='width:100%'>";
-  for (int i = 0; i < 8; i++) {
-    html += "<tr><td>R" + String(i + 1) + "</td><td>" +
-            String(digitalRead(PRIMARY[i]) == HIGH ? "BROKEN" : "clear") + "</td>"
-            "<td>S" + String(i + 1) + "</td><td>" +
-            String(digitalRead(SECONDARY[i]) == LOW ? "DETECTED" : "clear") + "</td></tr>";
-  }
-  html += "</table></div>";
-
-  html += "<div class='card'><h3>Last event</h3>" + lastEventResult +
-          " (" + String(sinceEvent) + " s ago)</div>";
-  html += "</body></html>";
-
-  server.send(200, "text/html", html);
-}
-
-// ════════════════════════════════════════════════════════════════
-// SETUP
-// ════════════════════════════════════════════════════════════════
-void setup() {
-  Serial.begin(115200);
-  Serial2.begin(115200, SERIAL_8N1, 16, 17); // UART2 for ESP32-CAM
-
-  // Both sensor buses are actively driven by their own circuits
-  // (buffer transistor for PRIMARY, onboard comparator for SECONDARY),
-  // so plain INPUT is correct — no internal pull-up needed or wanted.
-  for (int i = 0; i < 8; i++) {
-    pinMode(PRIMARY[i],   INPUT);
-    pinMode(SECONDARY[i], INPUT);
-  }
-
-  // Initialise SD card
-  sdReady = SD.begin(SD_CS);
-  if (sdReady) {
-    Serial.println("SD card ready.");
-  } else {
-    Serial.println("SD card not found - logging disabled.");
-  }
-
-  // Initialise ESP-NOW
-  WiFi.mode(WIFI_STA);
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("ESP-NOW init failed.");
+void retryEventIfNeeded(uint32_t now) {
+  if (!eventPending || now - lastAttempt < ACK_TIMEOUT_MS) return;
+  if (retryCount >= MAX_RETRIES) {
+    Serial.printf("No wrist ACK for seq=%lu after %u retries\n",
+                  (unsigned long)pendingPacket.sequence, retryCount);
+    eventPending = false;
     return;
   }
-  esp_now_register_recv_cb(onDataRecv);
-
-  // Register wrist unit as ESP-NOW peer
-  esp_now_peer_info_t peer = {};
-  memcpy(peer.peer_addr, WRIST_MAC, 6);
-  peer.channel = 0;
-  peer.encrypt = false;
-  esp_now_add_peer(&peer);
-
-  connectWifi();
-  bootMillis = millis();
-  server.on("/", handleRoot);
-  server.begin();
-  Serial.println("Web server started.");
-
-  Serial.print("Goal Post ");
-  Serial.print(POST_ID);
-  Serial.println(" ready and monitoring.");
+  ++retryCount;
+  lastAttempt = now;
+  transmit(pendingPacket);
+  Serial.printf("Retry %u for seq=%lu\n", retryCount,
+                (unsigned long)pendingPacket.sequence);
 }
 
-// ════════════════════════════════════════════════════════════════
-// MAIN LOOP
-// ════════════════════════════════════════════════════════════════
-void loop() {
-  static unsigned long lastReconnectAttempt = 0;
-  if (WiFi.status() != WL_CONNECTED && millis() - lastReconnectAttempt > 8000) {
-    lastReconnectAttempt = millis();
-    Serial.println("WiFi disconnected - reconnecting...");
-    // A plain WiFi.reconnect() after a failed/stuck association just errors
-    // forever ("sta is connecting, return error") instead of recovering —
-    // a full disconnect + begin actually resets the driver's state.
-    WiFi.disconnect();
-    delay(100);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  }
-  server.handleClient();
-
-  // ── STEP 1: Check primary beam sensors ──
-  int beamIndex = checkPrimary();
-  if (beamIndex >= 0 && !primaryTriggered) {
-    primaryTriggered = true;
-    primaryTime      = millis();
-    Serial.print("Primary beam broken: R");
-    Serial.println(beamIndex + 1);
-  }
-
-  // ── STEP 2: If primary triggered, watch for secondary ──
-  if (primaryTriggered) {
-    unsigned long elapsed = millis() - primaryTime;
-    if (elapsed <= DIRECTION_WINDOW) {
-      int tcrtIndex = checkSecondary();
-      if (tcrtIndex >= 0) {
-        Serial.println("Direction confirmed: INWARD. GOAL!");
-        requestCameraCapture();
-        sendGoalSignal(beamIndex, tcrtIndex);
-        primaryTriggered = false;
-        delay(COOLDOWN);   // prevent double-counting
-      }
-    } else {
-      Serial.println("Direction window expired. Event rejected.");
-      logEvent("REJECTED_NO_DIRECTION", beamIndex, -1);
-      primaryTriggered = false;
+void handleReceive(const uint8_t *sender, const uint8_t *data, int length) {
+  if (length != (int)sizeof(Packet) || memcmp(sender, wristMac, 6) != 0) return;
+  Packet packet;
+  memcpy(&packet, data, sizeof(packet));
+  if (packet.type == ACK) {
+    if (eventPending && packet.sequence == pendingPacket.sequence) {
+      eventPending = false;
+      Serial.printf("ACK seq=%lu from wrist\n", (unsigned long)packet.sequence);
     }
+    return;
   }
+  if (packet.type != COMMAND) return;
+  if (packet.command == START || packet.command == RESUME) matchActive = true;
+  if (packet.command == PAUSE || packet.command == END || packet.command == RESET) matchActive = false;
+  if (packet.command == RESET) {
+    eventLatched = false;
+    eventPending = false;
+    candidateMask = groupedMask = 0;
+  }
+  Serial.printf("Command=%u, match=%s\n", packet.command,
+                matchActive ? "ACTIVE" : "INACTIVE");
+}
 
-  delay(1);  // tiny delay to prevent watchdog reset
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+void receivePacket(const esp_now_recv_info *info, const uint8_t *data, int length) {
+  handleReceive(info->src_addr, data, length);
+}
+#else
+void receivePacket(const uint8_t *sender, const uint8_t *data, int length) {
+  handleReceive(sender, data, length);
+}
+#endif
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  for (uint8_t pin : SENSOR_PINS) pinMode(pin, INPUT_PULLUP);
+  Wire.begin(HUSKY_SDA_PIN, HUSKY_SCL_PIN);
+  Wire.setClock(100000);
+  lastHuskyAttempt = millis() - HUSKY_RETRY_MS;
+  connectHuskyLens(millis());
+  WiFi.mode(WIFI_STA);
+  esp_wifi_set_channel(CHANNEL, WIFI_SECOND_CHAN_NONE);
+  if (esp_now_init() != ESP_OK) { Serial.println("FATAL: ESP-NOW initialization failed"); return; }
+  esp_now_register_recv_cb(receivePacket);
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, wristMac, 6);
+  peer.channel = CHANNEL;
+  if (esp_now_add_peer(&peer) != ESP_OK) { Serial.println("FATAL: could not add wrist peer"); return; }
+  nextSequence = esp_random();
+  if (nextSequence == 0) nextSequence = 1;
+  Serial.printf("Goal post ready: %s\n", WiFi.macAddress().c_str());
+  Serial.println("Sensors: GPIO13, GPIO14, GPIO27, GPIO26 (E3F active LOW)");
+  Serial.printf("HUSKYLENS: SDA GPIO%u, SCL GPIO%u, decision assist %s\n",
+                HUSKY_SDA_PIN, HUSKY_SCL_PIN,
+                HUSKY_DECISION_ENABLED ? "enabled" : "monitor-only");
+  Serial.println("Waiting for Start Match from wrist");
+}
+
+void loop() {
+  uint32_t now = millis();
+  uint8_t currentMask = readSensorMask();
+  connectHuskyLens(now);
+  if (now - lastHeartbeat >= HEARTBEAT_MS) { lastHeartbeat = now; sendHeartbeat(currentMask); }
+  retryEventIfNeeded(now);
+  if (!matchActive) {
+    candidateMask = groupedMask = 0;
+    candidateSince = groupStarted = 0;
+    delay(2);
+    return;
+  }
+  if (!eventLatched) {
+    if (currentMask == 0) {
+      candidateMask = groupedMask = 0;
+      candidateSince = groupStarted = 0;
+    } else if (groupStarted == 0) {
+      if (currentMask != candidateMask) { candidateMask = currentMask; candidateSince = now; }
+      else if (now - candidateSince >= DEBOUNCE_MS) { groupedMask = currentMask; groupStarted = now; }
+    } else {
+      groupedMask |= currentMask;
+      if (now - groupStarted >= GROUP_WINDOW_MS) {
+        eventLatched = true;
+        clearSince = 0;
+        beginReliableEvent(groupedMask);
+      }
+    }
+  } else if (currentMask == 0) {
+    if (clearSince == 0) clearSince = now;
+    if (now - clearSince >= RELEASE_MS) {
+      eventLatched = false;
+      candidateMask = groupedMask = 0;
+      candidateSince = groupStarted = clearSince = 0;
+    }
+  } else clearSince = 0;
+  delay(2);
 }

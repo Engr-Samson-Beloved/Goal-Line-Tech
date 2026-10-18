@@ -13,5 +13,10 @@
     "name": "ESP32-S DevKit #2 (CH340, COM3)",
     "fqbn": "esp32:esp32:esp32",
     "role": "wrist unit (bench-test stand-in for ESP32-C3 Super Mini) — runs firmware/WristUnit"
+  },
+  "1c:db:d4:d3:6c:4c": {
+    "name": "ESP32-C3 Super Mini (native USB)",
+    "fqbn": "esp32:esp32:esp32c3",
+    "role": "actual wrist unit — runs firmware/WristUnit"
   }
 }
