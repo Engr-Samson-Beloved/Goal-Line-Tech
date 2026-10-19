@@ -8,10 +8,10 @@
 constexpr uint8_t CHANNEL = 1;
 constexpr uint8_t SENSOR_COUNT = 4;
 constexpr uint8_t SENSOR_PINS[SENSOR_COUNT] = {13, 14, 27, 26};
-constexpr uint8_t ACTIVE_LEVEL = LOW;
-constexpr uint32_t DEBOUNCE_MS = 40;
-constexpr uint32_t GROUP_WINDOW_MS = 100;
-constexpr uint32_t RELEASE_MS = 300;
+constexpr uint8_t ACTIVE_LEVEL = HIGH;
+constexpr uint8_t SENSOR_INPUT_MODE = INPUT_PULLDOWN;
+constexpr uint32_t DEBOUNCE_MS = 8;
+constexpr uint32_t RELEASE_MS = 60;
 constexpr uint32_t HEARTBEAT_MS = 1000;
 constexpr uint32_t ACK_TIMEOUT_MS = 250;
 constexpr uint8_t MAX_RETRIES = 8;
@@ -37,13 +37,13 @@ struct __attribute__((packed)) Packet {
 };
 
 volatile bool matchActive = false;
-volatile bool eventLatched = false;
 volatile bool eventPending = false;
 uint8_t candidateMask = 0;
-uint8_t groupedMask = 0;
+uint8_t stableMask = 0;
+uint8_t eventMask = 0;
+uint8_t eventClass = 0;
 uint8_t retryCount = 0;
 uint32_t candidateSince = 0;
-uint32_t groupStarted = 0;
 uint32_t clearSince = 0;
 uint32_t lastHeartbeat = 0;
 uint32_t lastAttempt = 0;
@@ -122,8 +122,7 @@ VisionResult checkBallAtGoal() {
   return BALL_NOT_CONFIRMED;
 }
 
-void beginReliableEvent(uint8_t eventMask) {
-  uint8_t sensorCount = bitCount(eventMask);
+void beginReliableEvent(uint8_t detectedMask, uint8_t sensorCount) {
   uint8_t decisionCount = sensorCount;
   VisionResult vision = VISION_UNAVAILABLE;
   if (HUSKY_DECISION_ENABLED && sensorCount == 1) {
@@ -135,7 +134,7 @@ void beginReliableEvent(uint8_t eventMask) {
 
   pendingPacket = {};
   pendingPacket.type = PKT_STATUS;
-  pendingPacket.mask = eventMask;
+  pendingPacket.mask = detectedMask;
   pendingPacket.count = decisionCount;
   pendingPacket.sequence = ++nextSequence;
   if (pendingPacket.sequence == 0) pendingPacket.sequence = ++nextSequence;
@@ -185,12 +184,16 @@ void handleReceive(const uint8_t *sender, const uint8_t *data, int length) {
   if (packet.command == START || packet.command == RESUME) matchActive = true;
   if (packet.command == PAUSE || packet.command == END || packet.command == RESET) matchActive = false;
   if (packet.command == RESET) {
-    eventLatched = false;
     eventPending = false;
-    candidateMask = groupedMask = 0;
+    eventMask = eventClass = 0;
+    clearSince = 0;
   }
-  Serial.printf("Command=%u, match=%s\n", packet.command,
-                matchActive ? "ACTIVE" : "INACTIVE");
+  static uint8_t lastLoggedCommand = 0;
+  if (packet.command != lastLoggedCommand) {
+    lastLoggedCommand = packet.command;
+    Serial.printf("Command=%u, match=%s\n", packet.command,
+                  matchActive ? "ACTIVE" : "INACTIVE");
+  }
 }
 
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
@@ -206,7 +209,7 @@ void receivePacket(const uint8_t *sender, const uint8_t *data, int length) {
 void setup() {
   Serial.begin(115200);
   delay(300);
-  for (uint8_t pin : SENSOR_PINS) pinMode(pin, INPUT_PULLUP);
+  for (uint8_t pin : SENSOR_PINS) pinMode(pin, SENSOR_INPUT_MODE);
   Wire.begin(HUSKY_SDA_PIN, HUSKY_SCL_PIN);
   Wire.setClock(100000);
   lastHuskyAttempt = millis() - HUSKY_RETRY_MS;
@@ -222,7 +225,7 @@ void setup() {
   nextSequence = esp_random();
   if (nextSequence == 0) nextSequence = 1;
   Serial.printf("Goal post ready: %s\n", WiFi.macAddress().c_str());
-  Serial.println("Sensors: GPIO13, GPIO14, GPIO27, GPIO26 (E3F active LOW)");
+  Serial.println("Sensors: GPIO13, GPIO14, GPIO27, GPIO26 (line sensors active HIGH)");
   Serial.printf("HUSKYLENS: SDA GPIO%u, SCL GPIO%u, decision assist %s\n",
                 HUSKY_SDA_PIN, HUSKY_SCL_PIN,
                 HUSKY_DECISION_ENABLED ? "enabled" : "monitor-only");
@@ -232,37 +235,38 @@ void setup() {
 void loop() {
   uint32_t now = millis();
   uint8_t currentMask = readSensorMask();
+  if (currentMask != candidateMask) {
+    candidateMask = currentMask;
+    candidateSince = now;
+  } else if (stableMask != candidateMask && now - candidateSince >= DEBOUNCE_MS) {
+    stableMask = candidateMask;
+    Serial.printf("SENSORS mask=0x%02X active=%u\n", stableMask, bitCount(stableMask));
+  }
   connectHuskyLens(now);
   if (now - lastHeartbeat >= HEARTBEAT_MS) { lastHeartbeat = now; sendHeartbeat(currentMask); }
   retryEventIfNeeded(now);
   if (!matchActive) {
-    candidateMask = groupedMask = 0;
-    candidateSince = groupStarted = 0;
+    eventMask = eventClass = 0;
+    clearSince = 0;
     delay(2);
     return;
   }
-  if (!eventLatched) {
-    if (currentMask == 0) {
-      candidateMask = groupedMask = 0;
-      candidateSince = groupStarted = 0;
-    } else if (groupStarted == 0) {
-      if (currentMask != candidateMask) { candidateMask = currentMask; candidateSince = now; }
-      else if (now - candidateSince >= DEBOUNCE_MS) { groupedMask = currentMask; groupStarted = now; }
-    } else {
-      groupedMask |= currentMask;
-      if (now - groupStarted >= GROUP_WINDOW_MS) {
-        eventLatched = true;
-        clearSince = 0;
-        beginReliableEvent(groupedMask);
-      }
-    }
-  } else if (currentMask == 0) {
+
+  uint8_t activeCount = bitCount(stableMask);
+  uint8_t currentClass = activeCount > 1 ? 2 : activeCount;
+  if (currentClass == 0) {
     if (clearSince == 0) clearSince = now;
     if (now - clearSince >= RELEASE_MS) {
-      eventLatched = false;
-      candidateMask = groupedMask = 0;
-      candidateSince = groupStarted = clearSince = 0;
+      eventMask = eventClass = 0;
+      clearSince = 0;
     }
-  } else clearSince = 0;
+  } else {
+    clearSince = 0;
+    eventMask |= stableMask;
+    if (currentClass > eventClass) {
+      eventClass = currentClass;
+      beginReliableEvent(eventMask, eventClass);
+    }
+  }
   delay(2);
 }

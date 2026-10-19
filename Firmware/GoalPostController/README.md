@@ -1,6 +1,6 @@
 # Goal-post controller wiring
 
-The production controller uses four active-low E3F NPN/open-collector sensor inputs:
+The production controller uses four active-HIGH digital line-sensor inputs:
 
 | Sensor | ESP32 pin |
 | --- | ---: |
@@ -10,15 +10,16 @@ The production controller uses four active-low E3F NPN/open-collector sensor inp
 | 4 | GPIO26 |
 
 Connect the controller and sensor interface to a common ground. The inputs use the
-ESP32's internal pull-ups and consider a LOW signal blocked. Each GPIO must receive
-a conditioned 0–3.3 V/open-collector signal. Do not connect a 5 V, 12 V, or raw
+ESP32's internal pull-downs and consider a HIGH signal blocked. Each GPIO must
+receive a conditioned 0-3.3 V digital signal. Do not connect a 5 V, 12 V, or raw
 industrial sensor output directly to an ESP32 GPIO; use the appropriate level
 shifter, optocoupler, or transistor interface.
 
-One active sensor produces `GOAL`. Two or more sensors active within the grouping
-window produce `CHECK VAR`. An event remains latched until all sensor inputs have
-been clear for 300 ms. Sensor events are accepted only while the wrist unit is in
-an active match.
+One active sensor produces `GOAL`. If a second sensor activates before the event
+clears, the display immediately updates to `CHECK VAR`. Inputs use an 8 ms
+debounce, and a new event is allowed after all sensor inputs have been clear for
+60 ms. Sensor events are accepted only while the wrist unit is in an active
+match. Unplugged inputs are held LOW and do not create an event.
 
 ## Optional HUSKYLENS assistant
 

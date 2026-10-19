@@ -40,7 +40,8 @@ The firmware detects an SSD1306-compatible OLED at I2C address `0x3C` or
 
 ## Goal-post ESP32 wiring
 
-The four E3F sensor inputs are active LOW and use the ESP32 internal pull-ups.
+The four digital line-sensor inputs are active HIGH and use the ESP32 internal
+pull-downs.
 
 | Sensor | Controller pin |
 | --- | ---: |
@@ -50,14 +51,16 @@ The four E3F sensor inputs are active LOW and use the ESP32 internal pull-ups.
 | Sensor 4 output | GPIO26 |
 | Sensor interface ground | GND |
 
-Each GPIO must receive a conditioned 0-3.3 V or true NPN open-collector signal.
+Each GPIO must receive a conditioned 0-3.3 V digital signal: LOW when clear and
+HIGH when blocked.
 Never connect a raw 5 V or 12 V sensor output directly to an ESP32 GPIO. Use a
 level shifter, transistor interface, or optocoupler when required, and join the
 interface ground to the controller ground.
 
-One active sensor produces `GOAL`. Two or more sensors grouped within 100 ms
-produce `CHECK VAR`. Events are accepted only while the wrist reports an active
-match.
+One active sensor produces `GOAL`. A second active sensor immediately upgrades
+the same passage to `CHECK VAR`. Inputs use an 8 ms debounce, and another event
+can begin after every input has been clear for 60 ms. Events are accepted only
+while the wrist reports an active match.
 
 ## HUSKYLENS wiring
 
